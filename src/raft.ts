@@ -3,8 +3,9 @@ import type {
     AppendEntriesCall,
     AppendEntriesReply,
     CreateArgs,
-    LogEntry,
-    ProposeCall,
+    LeaderState,
+    PeerID,
+    ProposeCommandCall,
     Raft,
     RaftConfig,
     RaftMessage,
@@ -76,45 +77,26 @@ export function step(raft: Raft, time: number, receive: () => RaftMessage | unde
     }
 
     if (sm.status === 'LEADER') {
-        let results: StepResult | undefined;
-
         if (time >= sm.heartbeatTimeout) {
             // paper(Figure 2): Upon election: send initial empty AppendEntries
             // RPCs (heartbeat) to each server; repeat during idle periods to
             // prevent election timeouts (§5.2)
 
-            (results ??= []).push(...sendHeartbeats(raft, time));
-        }
-
-        for (const pendingCall of sm.pendingCalls) {
-            if (time >= pendingCall.timeSent) {
-                // paper(5.3): If followers crash or run slowly, or if network
-                // packets are lost, the leader retries AppendEntries RPCs
-                // indefinitely (even after it has responded to the client)
-                // until all followers eventually store all log entries.
-
-                pendingCall.timeSent = time;
-
-                (results ??= []).push(pendingCall.message);
-            }
-        }
-
-        if (results !== undefined) {
-            return results;
+            return sendHeartbeats(raft, time);
         }
     }
 
     const message = receive();
 
     if (message !== undefined) {
-        if (message.name === 'PROPOSE') {
+        if (message.name === 'PROPOSE_COMMAND') {
             // Handle client requests
 
             if (message.type === 'CALL') {
                 return handleProposeCall(raft, time, message);
             } else {
                 // TODO: Drop the invalid message
-                return [];
+                return;
             }
         }
 
@@ -133,21 +115,24 @@ export function step(raft: Raft, time: number, receive: () => RaftMessage | unde
 
             if (message.type === 'CALL') {
                 if (message.name === 'APPEND_ENTRIES') {
-                    return [
-                        {
+                    return {
+                        type: 'SEND',
+                        message: {
                             type: 'REPLY',
                             name: 'APPEND_ENTRIES',
                             from: raft.config.id,
                             to: message.from,
                             term: raft.state.persistent.currentTerm,
                             success: false,
+                            entryCount: 0,
                         },
-                    ];
+                    };
                 }
 
                 if (message.name === 'REQUEST_VOTE') {
-                    return [
-                        {
+                    return {
+                        type: 'SEND',
+                        message: {
                             type: 'REPLY',
                             name: 'REQUEST_VOTE',
                             from: raft.config.id,
@@ -155,12 +140,12 @@ export function step(raft: Raft, time: number, receive: () => RaftMessage | unde
                             term: raft.state.persistent.currentTerm,
                             voteGranted: false,
                         },
-                    ];
+                    };
                 }
             }
 
             // TODO: Is dropping the message the correct thing to do here?
-            return [];
+            return;
         }
 
         switch (message.name) {
@@ -181,11 +166,7 @@ export function step(raft: Raft, time: number, receive: () => RaftMessage | unde
         }
     }
 
-    // paper(Figure 2): If commitIndex > lastApplied: increment lastApplied,
-    // apply log[lastApplied] to state machine (§5.3)
-
-    // XXX
-    return [];
+    return;
 }
 
 function getElectionTimeout(config: RaftConfig, time: number): number {
@@ -201,11 +182,19 @@ function getHeartbeatTimeout(raft: Raft, time: number): number {
     return time + raft.config.heartbeatTimeout;
 }
 
-function becomeCandidate(raft: Raft, time: number): StepResult {
-    // TODO:
-    // - [x] Implement Figure 2
-    // - [ ] Figure out how what `lastLogIndex` and `lastLogTerm` should be
+function getLastLogIndexAndTerm(raft: Raft): { lastLogIndex: number; lastLogTerm: number } {
+    const { log } = raft.state.persistent;
 
+    if (log.length === 0) {
+        return { lastLogIndex: 0, lastLogTerm: 0 };
+    }
+
+    const { index: lastLogIndex, term: lastLogTerm } = log[log.length - 1]!;
+
+    return { lastLogIndex, lastLogTerm };
+}
+
+function becomeCandidate(raft: Raft, time: number): StepResult {
     // paper(Figure 2): On conversion to candidate, start election:
     // • Increment currentTerm
     // • Vote for self
@@ -224,23 +213,29 @@ function becomeCandidate(raft: Raft, time: number): StepResult {
         votesReceived: new Set([raft.config.id]),
     };
 
-    const result: StepResult = [];
+    const { lastLogIndex, lastLogTerm } = getLastLogIndexAndTerm(raft);
+
+    const messages: RaftMessage[] = [];
+
     for (const to of raft.config.peers) {
         raft.config.log(raft, time, `sending REQUEST_VOTE to ${to}`);
 
-        result.push({
+        messages.push({
             type: 'CALL',
             name: 'REQUEST_VOTE',
             from: raft.config.id,
             to,
             term: raft.state.persistent.currentTerm,
             candidateId: raft.config.id,
-            lastLogIndex: 0, // TODO
-            lastLogTerm: 0, // TODO
+            lastLogIndex,
+            lastLogTerm,
         });
     }
 
-    return result;
+    return {
+        type: 'SEND',
+        messages,
+    };
 }
 
 function becomeFollower(raft: Raft, time: number, discoveredTerm: number): void {
@@ -266,12 +261,31 @@ function resetElectionTimeout(raft: Raft, time: number): void {
 function becomeLeader(raft: Raft, time: number): StepResult {
     // sends heartbeats at some point
 
+    // paper(Figure 2): for each server, index of the next log entry to send to
+    // that server (initialized to leader log index + 1)
+    const nextIndex = new Map<PeerID, number>();
+
+    const { log } = raft.state.persistent;
+    const leaderNextLogIndex = (log[log.length - 1]?.index ?? 0) + 1;
+
+    for (const id of raft.config.peers) {
+        nextIndex.set(id, leaderNextLogIndex);
+    }
+
+    // paper(Figure 2): for each server, index of highest log entry to be
+    // replicated on server (initialized to 0, increases monotonically)
+    const matchIndex = new Map<PeerID, number>();
+
+    for (const id of raft.config.peers) {
+        matchIndex.set(id, 0);
+    }
+
     raft.state.sm = {
         status: 'LEADER',
         heartbeatTimeout: 0, // Set in `sendHeartbeats`
-        pendingCalls: [],
-        nextIndex: new Map(), // XXX
-        matchIndex: new Map(), // XXX
+        nextIndex,
+        matchIndex,
+        proposalCommitQueue: [],
     };
 
     raft.config.log(raft, time, 'became leader');
@@ -280,45 +294,33 @@ function becomeLeader(raft: Raft, time: number): StepResult {
 }
 
 function sendHeartbeats(raft: Raft, time: number): StepResult {
-    assert(raft.state.sm.status === 'LEADER');
+    const { sm } = raft.state;
 
-    raft.state.sm.heartbeatTimeout = getHeartbeatTimeout(raft, time);
+    assert(sm.status === 'LEADER');
 
     raft.config.log(raft, time, 'sending heartbeats');
 
-    const result: StepResult = [];
-
-    for (const to of raft.config.peers) {
-        result.push({
-            type: 'CALL',
-            name: 'APPEND_ENTRIES',
-            from: raft.config.id,
-            to,
-            term: raft.state.persistent.currentTerm,
-            leaderId: raft.config.id,
-            prevLogIndex: 0, // XXX
-            prevLogTerm: 0, // XXX
-            entries: [],
-            leaderCommit: 0, // XXX
-        });
-    }
-
-    return result;
+    // Send (potentially empty) AppendEntries to all peers
+    return replicateLog(raft, sm, time);
 }
 
-function handleProposeCall(raft: Raft, time: number, message: ProposeCall): StepResult {
+function handleProposeCall(raft: Raft, time: number, message: ProposeCommandCall): StepResult {
+    // TODO: Message validation
+
     const { sm } = raft.state;
 
     if (sm.status !== 'LEADER') {
-        return [
-            {
+        // TODO: Help the client discover the leader PeerID
+        return {
+            type: 'SEND',
+            message: {
                 type: 'REPLY',
-                name: 'PROPOSE',
+                name: 'PROPOSE_COMMAND',
                 from: raft.config.id,
                 to: message.from,
                 success: false,
             },
-        ];
+        };
     }
 
     // paper(5.3): Once a leader has been elected, it begins servicing client
@@ -327,140 +329,269 @@ function handleProposeCall(raft: Raft, time: number, message: ProposeCall): Step
     // new entry, then issues AppendEntries RPCs in parallel to each of the
     // other servers to replicate the entry.
 
-    const entries: LogEntry[] = [];
+    // Push new commands onto the log
 
-    for (const command of message.commands) {
-        entries.push({
+    const { log } = raft.state.persistent;
+
+    // The first index for the new entries is the last index in the log or 1
+    const startIndex = (log[log.length - 1]?.index ?? 0) + 1;
+
+    for (let i = 0; i < message.commands.length; ++i) {
+        const command = message.commands[i]!;
+        const index = startIndex + i;
+
+        raft.config.log(raft, time, `append entry ${index}`);
+
+        log.push({
+            index,
             term: raft.state.persistent.currentTerm,
             command,
         });
     }
 
-    const firstIndex = raft.state.persistent.log.length + 1;
+    // TODO: What happens when a leader crashes? There will be some clients that
+    // never receive a response. Need a way to make ProposeCommandCall
+    // idempotent so that the client can call it multiple times to eventually
+    // get back a response
 
-    raft.state.persistent.log.push(...entries);
+    // Keep track of which entries were pushed by which clients. When an entry
+    // is commited, send a ProposeCommandReply back to the original client
+    sm.proposalCommitQueue.push({
+        startIndex,
+        entryCount: message.commands.length,
+        clientId: message.from,
+    });
 
-    const result: StepResult = [];
+    // Send AppendEntries to all peers
+    return replicateLog(raft, sm, time);
+}
 
-    for (const to of raft.config.peers) {
-        const message: AppendEntriesCall = {
+function replicateLog(raft: Raft, sm: LeaderState, time: number): StepResult {
+    // Reset the heartbeat timeout
+    sm.heartbeatTimeout = getHeartbeatTimeout(raft, time);
+
+    const messages: RaftMessage[] = [];
+
+    for (const id of raft.config.peers) {
+        const nextIndex = sm.nextIndex.get(id);
+
+        // This should always be initialized to the last log entry index + 1 for
+        // each peer. If the leader log is empty, it's initialized to 1 which
+        // makes sense since that's the index of "next entry" that will be
+        // appened to the log for an empty log
+        assert(nextIndex !== undefined);
+
+        // Index of the log entry that comes immediately before the first new
+        // entry that the leader sends to the client. Zero when the log is empty
+        const prevLogIndex = nextIndex - 1;
+
+        const { log } = raft.state.persistent;
+        const prevLogEntry = log[prevLogIndex - 1];
+
+        // Term of the `prevLogIndex` entry. Zero when the log is empty. Notice
+        // that no leader, and therefore no log entry, will ever actually have a
+        // term equal to 0
+        const prevLogTerm = prevLogEntry?.term ?? 0;
+
+        // Get all new entries in the log starting at the array position
+        // corresponding to `nextIndex`
+        const entries = log.slice(nextIndex - 1);
+
+        messages.push({
             type: 'CALL',
             name: 'APPEND_ENTRIES',
             from: raft.config.id,
-            to,
+            to: id,
             term: raft.state.persistent.currentTerm,
             leaderId: raft.config.id,
-            prevLogIndex: 0, // XXX
-            prevLogTerm: 0, // XXX
-            entries, // TODO,
-            leaderCommit: 0, // XXX
-        };
-
-        sm.pendingCalls.push({
-            message,
-            timeSent: time,
-            firstIndex,
+            prevLogIndex,
+            prevLogTerm,
+            entries,
+            leaderCommit: raft.state.volatile.commitIndex,
         });
-
-        result.push(message);
     }
 
-    // TODO: Need a way to track the progress of these entries so that the
-    // client can be notified when it is replicated
-
-    return result;
+    return {
+        type: 'SEND',
+        messages,
+    };
 }
 
 function handleAppendEntriesCall(raft: Raft, time: number, message: AppendEntriesCall): StepResult {
+    // TODO: Message validation
+
     assert(raft.state.persistent.currentTerm === message.term);
-
-    // TODO:
-    // - [ ] Actually update the log
-
-    // Receiver implementation:
-    // 2. Reply false if log doesn’t contain an entry at prevLogIndex whose term
-    //    matches prevLogTerm (§5.3)
-    // 3. If an existing entry conflicts with a new one (same index but
-    //    different terms), delete the existing entry and all that follow it
-    //    (§5.3)
-    // 4. Append any new entries not already in the log
-    // 5. If leaderCommit > commitIndex, set commitIndex = min(leaderCommit,
-    //    index of last new entry)
 
     const { sm } = raft.state;
 
-    if (sm.status === 'FOLLOWER') {
+    // paper(Figure 3): Election Safety: at most one leader can be elected in a
+    // given term. §5.2
+
+    assert(sm.status !== 'LEADER', 'not possible for two leaders to exist during the same term');
+
+    if (sm.status === 'CANDIDATE') {
+        // paper(5.2): If the leader’s term (included in its RPC) is at least as
+        // large as the candidate’s current term, then the candidate recognizes
+        // the leader as legitimate and returns to follower state.
+
+        // Where "at least as large" means greater-than-or-equal
+
+        becomeFollower(raft, time, message.term);
+    } else {
+        // If server was already a follower, reset the election timeout since
+
+        // paper(5.2): When servers start up, they begin as followers. A server
+        // remains in follower state as long as it receives valid RPCs from a
+        // leader or candidate.
+
         resetElectionTimeout(raft, time);
     }
 
-    if (sm.status !== 'FOLLOWER') {
-        // Justification for candidate: paper(5.2): While waiting for votes, a
-        // candidate may receive an AppendEntries RPC from another server
-        // claiming to be leader. If the leader’s term (included in its RPC) is
-        // at least as large as the candidate’s current term, then the candidate
-        // recognizes the leader as legitimate and returns to follower state.
+    // Sanity check. At this point the server is either already a follower or
+    // was a candidate and reverted to being a follower
+    assert(sm.status === 'FOLLOWER');
 
-        // TODO: Justification for leader
+    // paper(5.3): When sending an AppendEntries RPC, the leader includes the
+    // index and term of the entry in its log that immediately precedes the new
+    // entries. If the follower does not find an entry in its log with the same
+    // index and term, then it refuses the new entries.
 
-        // TODO: Justification for returning `success = true` when we didn't
-        // even consider entries
+    const { prevLogIndex, prevLogTerm } = message;
+    const { log } = raft.state.persistent;
 
-        // Return to the follower state with term equal to the leader sending
-        // AppendEntries. `currentTerm` will be set by `becomeFollower`
-        const discoveredTerm = message.term;
+    // If the leader's log is empty OR the follower's log contains an entry at
+    // `prevLogIndex` with term equal to `prevLogTerm`
 
-        becomeFollower(raft, time, discoveredTerm);
+    // prettier-ignore
+    const isConsistent =
+        prevLogIndex === 0 || (
+            prevLogIndex <= log.length &&
+            log[prevLogIndex - 1]!.term === prevLogTerm
+        );
 
-        return [
-            {
-                type: 'REPLY',
-                name: 'APPEND_ENTRIES',
-                from: raft.config.id,
-                to: message.from,
-                term: discoveredTerm,
-                success: true,
-            },
-        ];
+    if (isConsistent) {
+        // The log position that the new entries will start at
+        const startPos = prevLogIndex;
+
+        // Entries already in the follower's log that will be deleted
+        const deleteCount = log.length - startPos;
+
+        // Splice in new entries
+        log.splice(startPos, deleteCount, ...message.entries);
+
+        // Update the peer's max committed entry index. It must not be greater
+        // than the last entry replicated to this peer
+        if (message.leaderCommit > raft.state.persistent.currentTerm) {
+            raft.state.persistent.currentTerm = Math.min(message.leaderCommit, log.length);
+        }
     }
 
-    return [];
+    return {
+        type: 'SEND',
+        message: {
+            type: 'REPLY',
+            name: 'APPEND_ENTRIES',
+            from: raft.config.id,
+            to: message.from,
+            term: raft.state.persistent.currentTerm,
+            success: isConsistent,
+            entryCount: message.entries.length,
+        },
+    };
 }
 
 function handleAppendEntriesReply(raft: Raft, message: AppendEntriesReply): StepResult {
+    // TODO: Message validation
+
     assert(raft.state.persistent.currentTerm === message.term);
 
     const { sm } = raft.state;
 
-    if (sm.status === 'LEADER') {
-        if (message.success === true && message.firstIndex !== undefined) {
-            // TODO: Does `success` true mean that replication happened? Because
-            // the paper makes it seem like it actualy just has to do with a
-            // validation check. But maybe that check only happens if
-            // replication also happens...
-
-            sm.pendingCalls = sm.pendingCalls.filter(x => {
-                // Cleanup any pending AppendEntry call(s) that this reply is in
-                // response to
-
-                if (x.message.to === message.from && x.firstIndex === message.firstIndex) {
-                    return false;
-                }
-                return true;
-            });
-        }
+    if (sm.status !== 'LEADER') {
+        // TODO: Just drop the message?
+        return;
     }
 
-    // TODO: Nothing really to do here? Do we do anything when `message.success`
-    // is false?
+    const nextIndex = sm.nextIndex.get(message.from);
+    const matchIndex = sm.matchIndex.get(message.from);
 
-    return [];
+    // TODO: Should instead perform message validation before processing the
+    // message. If we receive a message from a peer and we know about that
+    // peer then other peer-related state should be valid
+    assert(nextIndex !== undefined && matchIndex !== undefined);
+
+    if (message.success === true) {
+        // Advance `nextIndex` by the number of entries sent in the original
+        // request
+        sm.nextIndex.set(message.from, nextIndex + message.entryCount);
+
+        // Peer has replicated entries starting at `nextIndex` up to the index
+        // of the last entry sent
+        sm.matchIndex.set(message.from, nextIndex + message.entryCount - 1);
+
+        // If `entryCount == 0` then `nextIndex` doesn't change, but
+        // `matchIndex` is updated to reflect that the peer has an entry
+        // matching `prevLogIndex` and `prevLogTerm` in their log
+
+        const { log } = raft.state.persistent;
+        const { commitIndex } = raft.state.volatile;
+
+        // Iterate through all uncommitted entries to find the largest entry
+        // index that is replicated to a majority of followers
+        for (let i = commitIndex + 1; i <= log.length; ++i) {
+            // Count the leader once
+            let replicationCount = 1;
+
+            for (const id of raft.config.peers) {
+                const matchIndex = sm.matchIndex.get(id);
+
+                // TODO: Should make this a helper function...
+                assert(matchIndex !== undefined);
+
+                // Is the highest replicated entry index on this peer >= the
+                // i'th uncommitted entry on the leader? If it is, then the i'th
+                // entry has been replicated to that peer
+                if (matchIndex >= i) {
+                    replicationCount += 1;
+                }
+            }
+
+            // Has i'th entry has been replicated to a majority of servers?
+            if (replicationCount * 2 > raft.config.peers.length + 1) {
+                raft.state.volatile.commitIndex = i;
+            }
+        }
+
+        {
+            // paper(Figure 2): If commitIndex > lastApplied: increment
+            // lastApplied, apply log[lastApplied] to state machine (§5.3)
+
+            const { commitIndex, lastApplied } = raft.state.volatile;
+
+            if (commitIndex > lastApplied) {
+                const entries = log.slice(lastApplied);
+                raft.state.volatile.lastApplied = commitIndex;
+                return { type: 'APPLY', entries };
+            }
+        }
+
+        return;
+    } else {
+        sm.nextIndex.set(message.from, nextIndex - 1);
+
+        // TODO: Immediately retry sending AppendEntries. Track peers that
+        // replied with `sucess == false` with an array of PeerIDs
+        // `pendingRetries: PeerID[]` which is cleared after heartbeats are sent
+
+        // TODO: Send retries
+        return;
+    }
 }
 
 function handleRequestVotesCall(raft: Raft, time: number, message: RequestVoteCall): StepResult {
-    assert(raft.state.persistent.currentTerm === message.term);
+    // TODO: Validate message before processing
 
-    // TODO:
-    // - [ ] Check that log is at least as up-to-date
+    assert(raft.state.persistent.currentTerm === message.term);
 
     // Receiver implementation:
     // 2. If votedFor is null or candidateId, and candidate’s log is at least as
@@ -469,29 +600,46 @@ function handleRequestVotesCall(raft: Raft, time: number, message: RequestVoteCa
     const { sm } = raft.state;
 
     if (sm.status === 'FOLLOWER' || sm.status === 'CANDIDATE') {
+        // If the peer hasn't already voted for any candidates or they have
+        // already voted for this candidate and are responding to a duplicate
+        // RequestVotes RPC
+
         // paper(5.2): Each server will vote for at most one candidate in a
         // given term, on a first-come-first-served basis
 
         const { votedFor } = raft.state.persistent;
 
         if (votedFor === null || votedFor === message.candidateId) {
-            raft.state.persistent.votedFor = message.candidateId;
-            sm.electionTimeout = getElectionTimeout(raft.config, time);
-            return [
-                {
-                    type: 'REPLY',
-                    name: 'REQUEST_VOTE',
-                    from: raft.config.id,
-                    to: message.from,
-                    term: raft.state.persistent.currentTerm,
-                    voteGranted: true,
-                },
-            ];
+            const { lastLogIndex, lastLogTerm } = getLastLogIndexAndTerm(raft);
+
+            // paper(5.4.1): [...] the voter denies its vote if its own log is
+            // more up-to-date than that of the candidate.
+
+            const logsSynced =
+                message.lastLogTerm > lastLogTerm ||
+                (message.lastLogTerm === lastLogTerm && message.lastLogIndex >= lastLogIndex);
+
+            if (logsSynced) {
+                raft.state.persistent.votedFor = message.candidateId;
+                sm.electionTimeout = getElectionTimeout(raft.config, time);
+                return {
+                    type: 'SEND',
+                    message: {
+                        type: 'REPLY',
+                        name: 'REQUEST_VOTE',
+                        from: raft.config.id,
+                        to: message.from,
+                        term: raft.state.persistent.currentTerm,
+                        voteGranted: true,
+                    },
+                };
+            }
         }
     }
 
-    return [
-        {
+    return {
+        type: 'SEND',
+        message: {
             type: 'REPLY',
             name: 'REQUEST_VOTE',
             from: raft.config.id,
@@ -499,23 +647,25 @@ function handleRequestVotesCall(raft: Raft, time: number, message: RequestVoteCa
             term: raft.state.persistent.currentTerm,
             voteGranted: false,
         },
-    ];
+    };
 }
 
 function handleRequestVotesReply(raft: Raft, time: number, message: RequestVoteReply): StepResult {
+    // TODO: Validate message before processing
+
     assert(raft.state.persistent.currentTerm === message.term);
 
     const sm = raft.state.sm;
 
     if (sm.status !== 'CANDIDATE') {
-        return [];
+        return;
     }
 
     if (message.voteGranted) {
+        // Make sure that each vote is only counted once per peer
+
         // paper(5.2): Each server will vote for at most one candidate
 
-        // Make sure that each vote is only counted once per server. This is in
-        // case of message duplication
         sm.votesReceived.add(message.from);
 
         raft.config.log(raft, time, 'vote granted by', message.from);
@@ -533,5 +683,5 @@ function handleRequestVotesReply(raft: Raft, time: number, message: RequestVoteR
         raft.config.log(raft, time, 'vote denied by', message.from);
     }
 
-    return [];
+    return;
 }

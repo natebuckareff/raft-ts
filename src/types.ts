@@ -12,12 +12,12 @@ export interface RaftConfig {
     id: PeerID;
     peers: PeerID[];
     rng: RNG;
-    log: RaftLogger;
+    log: Logger;
     electionInterval: [number, number] | undefined;
     heartbeatTimeout: number;
 }
 
-export interface RaftLogger {
+export interface Logger {
     <Args extends any[]>(raft: Raft, time: number, message: string, ...args: Args): void;
 }
 
@@ -34,6 +34,7 @@ export interface RaftPersistent {
 }
 
 export interface LogEntry {
+    index: number;
     term: number;
     command:
         | { type: 'SET'; name: string; value: number }
@@ -62,39 +63,50 @@ export interface CandidateState {
 export interface LeaderState {
     status: 'LEADER';
     heartbeatTimeout: number;
-    pendingCalls: PendingAppendEntries[];
     nextIndex: Map<PeerID, number>;
     matchIndex: Map<PeerID, number>;
+    proposalCommitQueue: ProposalEntry[];
 }
 
-export interface PendingAppendEntries {
-    message: AppendEntriesCall;
-    timeSent: number;
-    firstIndex: number;
+// When the leader receives a ProposeCommandCall from a client, it appends the
+// new entry to the log, and pushes a ProposalEntry onto the proposal commit
+// queue. When the first entry added by the proposal is committed, the leader
+// will a ProposeCommandReply back to the client
+export interface ProposalEntry {
+    startIndex: number;
+    entryCount: number;
+    clientId: PeerID;
 }
 
-export type StepResult = RaftMessage[];
+// TODO: This could also be used for logging and any other side effects that
+// don't require returning anything
+
+export type StepResult =
+    | { type: 'SEND'; message: RaftMessage }
+    | { type: 'SEND'; messages: RaftMessage[] }
+    | { type: 'APPLY'; entries: LogEntry[] }
+    | void;
 
 export type RaftMessage =
-    | ProposeCall
-    | ProposeReply
+    | ProposeCommandCall
+    | ProposeCommandReply
     | AppendEntriesCall
     | AppendEntriesReply
     | RequestVoteCall
     | RequestVoteReply;
 
-export interface ProposeCall {
+export interface ProposeCommandCall {
     type: 'CALL';
-    name: 'PROPOSE';
+    name: 'PROPOSE_COMMAND';
     id: MessageID;
     from: PeerID;
     to: PeerID;
     commands: LogEntry['command'][];
 }
 
-export interface ProposeReply {
+export interface ProposeCommandReply {
     type: 'REPLY';
-    name: 'PROPOSE';
+    name: 'PROPOSE_COMMAND';
     from: PeerID;
     to: PeerID;
     success: boolean;
@@ -120,7 +132,10 @@ export interface AppendEntriesReply {
     to: PeerID;
     term: number;
     success: boolean;
-    firstIndex?: number; // To identify the original CALL
+
+    // Included to update `nextIndex` without needing to complicate the leader's
+    // internal state
+    entryCount: number;
 }
 
 export interface RequestVoteCall {

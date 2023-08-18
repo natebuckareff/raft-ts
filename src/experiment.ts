@@ -1,6 +1,6 @@
 import { create, step } from './raft.js';
 import type { RNG } from './rng.js';
-import type { PeerID, Raft, RaftConfig, RaftLogger, RaftMessage, StepResult } from './types.js';
+import type { Logger, PeerID, Raft, RaftConfig, RaftMessage } from './types.js';
 
 async function intervalLoop(maxIterations: number, timestep: number, fn: (time: number) => void) {
     return new Promise<number>(resolve => {
@@ -57,7 +57,7 @@ class InboxSet {
 export interface ExperimentConfig {
     peerCount: number;
     rng: RNG;
-    log: RaftLogger;
+    log: Logger;
     electionInterval: [number, number] | undefined;
     heartbeatTimeout: number;
     maxIterations: number;
@@ -94,7 +94,7 @@ export async function runExperiment(config: ExperimentConfig) {
     const inboxes = new InboxSet();
 
     const fn = (time: number) => {
-        const results: StepResult = [];
+        const messages: RaftMessage[] = [];
 
         for (const hook of config.hooks) {
             hook(servers, time);
@@ -103,11 +103,20 @@ export async function runExperiment(config: ExperimentConfig) {
         for (const server of servers) {
             const { queue, receive } = inboxes.get(server.config.id);
             do {
-                results.push(...step(server, time, receive));
+                const result = step(server, time, receive);
+                if (result !== undefined) {
+                    if (result.type === 'SEND') {
+                        if ('message' in result) {
+                            messages.push(result.message);
+                        } else {
+                            messages.push(...result.messages);
+                        }
+                    }
+                }
             } while (queue.length > 0);
         }
 
-        for (const message of results) {
+        for (const message of messages) {
             inboxes.send(message);
         }
     };
