@@ -15,7 +15,7 @@ import type {
 } from './types';
 import { randomInterval } from './util.js';
 
-export function create({ config, persistent, time }: CreateArgs): Raft {
+export function create<Cmd>({ config, persistent, time }: CreateArgs<Cmd>): Raft<Cmd> {
     return {
         config,
         state: {
@@ -48,7 +48,7 @@ export function create({ config, persistent, time }: CreateArgs): Raft {
     };
 }
 
-export function step(raft: Raft, time: number, receive: () => RaftMessage | undefined): StepResult {
+export function step<Cmd>(raft: Raft<Cmd>, time: number, receive: () => RaftMessage<Cmd> | undefined): StepResult<Cmd> {
     // TODO:
     // - [ ] Figure out when to do the `commitIndex > lastApplied` check and how
 
@@ -169,7 +169,7 @@ export function step(raft: Raft, time: number, receive: () => RaftMessage | unde
     return;
 }
 
-function getElectionTimeout(config: RaftConfig, time: number): number {
+function getElectionTimeout<Cmd>(config: RaftConfig<Cmd>, time: number): number {
     // XXX TODO: Slowed down
 
     // paper(5.2): 150–300ms
@@ -178,11 +178,11 @@ function getElectionTimeout(config: RaftConfig, time: number): number {
     return time + randomInterval(config.rng, ...interval);
 }
 
-function getHeartbeatTimeout(raft: Raft, time: number): number {
+function getHeartbeatTimeout<Cmd>(raft: Raft<Cmd>, time: number): number {
     return time + raft.config.heartbeatTimeout;
 }
 
-function getLastLogIndexAndTerm(raft: Raft): { lastLogIndex: number; lastLogTerm: number } {
+function getLastLogIndexAndTerm<Cmd>(raft: Raft<Cmd>): { lastLogIndex: number; lastLogTerm: number } {
     const { log } = raft.state.persistent;
 
     if (log.length === 0) {
@@ -194,7 +194,7 @@ function getLastLogIndexAndTerm(raft: Raft): { lastLogIndex: number; lastLogTerm
     return { lastLogIndex, lastLogTerm };
 }
 
-function becomeCandidate(raft: Raft, time: number): StepResult {
+function becomeCandidate<Cmd>(raft: Raft<Cmd>, time: number): StepResult<Cmd> {
     // paper(Figure 2): On conversion to candidate, start election:
     // • Increment currentTerm
     // • Vote for self
@@ -215,7 +215,7 @@ function becomeCandidate(raft: Raft, time: number): StepResult {
 
     const { lastLogIndex, lastLogTerm } = getLastLogIndexAndTerm(raft);
 
-    const messages: RaftMessage[] = [];
+    const messages: RaftMessage<Cmd>[] = [];
 
     for (const to of raft.config.peers) {
         raft.config.log(raft, time, `sending REQUEST_VOTE to ${to}`);
@@ -238,7 +238,7 @@ function becomeCandidate(raft: Raft, time: number): StepResult {
     };
 }
 
-function becomeFollower(raft: Raft, time: number, discoveredTerm: number): void {
+function becomeFollower<Cmd>(raft: Raft<Cmd>, time: number, discoveredTerm: number): void {
     // Becoming a follower because another term was discovered, so switch to
     // that term
     raft.state.persistent.currentTerm = discoveredTerm;
@@ -252,13 +252,13 @@ function becomeFollower(raft: Raft, time: number, discoveredTerm: number): void 
     };
 }
 
-function resetElectionTimeout(raft: Raft, time: number): void {
+function resetElectionTimeout<Cmd>(raft: Raft<Cmd>, time: number): void {
     assert(raft.state.sm.status !== 'LEADER');
 
     raft.state.sm.electionTimeout = getElectionTimeout(raft.config, time);
 }
 
-function becomeLeader(raft: Raft, time: number): StepResult {
+function becomeLeader<Cmd>(raft: Raft<Cmd>, time: number): StepResult<Cmd> {
     // sends heartbeats at some point
 
     // paper(Figure 2): for each server, index of the next log entry to send to
@@ -293,7 +293,7 @@ function becomeLeader(raft: Raft, time: number): StepResult {
     return sendHeartbeats(raft, time);
 }
 
-function sendHeartbeats(raft: Raft, time: number): StepResult {
+function sendHeartbeats<Cmd>(raft: Raft<Cmd>, time: number): StepResult<Cmd> {
     const { sm } = raft.state;
 
     assert(sm.status === 'LEADER');
@@ -304,7 +304,7 @@ function sendHeartbeats(raft: Raft, time: number): StepResult {
     return replicateLog(raft, sm, time);
 }
 
-function handleProposeCall(raft: Raft, time: number, message: ProposeCommandCall): StepResult {
+function handleProposeCall<Cmd>(raft: Raft<Cmd>, time: number, message: ProposeCommandCall<Cmd>): StepResult<Cmd> {
     // TODO: Message validation
 
     const { sm } = raft.state;
@@ -366,11 +366,11 @@ function handleProposeCall(raft: Raft, time: number, message: ProposeCommandCall
     return replicateLog(raft, sm, time);
 }
 
-function replicateLog(raft: Raft, sm: LeaderState, time: number): StepResult {
+function replicateLog<Cmd>(raft: Raft<Cmd>, sm: LeaderState, time: number): StepResult<Cmd> {
     // Reset the heartbeat timeout
     sm.heartbeatTimeout = getHeartbeatTimeout(raft, time);
 
-    const messages: RaftMessage[] = [];
+    const messages: RaftMessage<Cmd>[] = [];
 
     for (const id of raft.config.peers) {
         const nextIndex = sm.nextIndex.get(id);
@@ -417,7 +417,7 @@ function replicateLog(raft: Raft, sm: LeaderState, time: number): StepResult {
     };
 }
 
-function handleAppendEntriesCall(raft: Raft, time: number, message: AppendEntriesCall): StepResult {
+function handleAppendEntriesCall<Cmd>(raft: Raft<Cmd>, time: number, message: AppendEntriesCall<Cmd>): StepResult<Cmd> {
     // TODO: Message validation
 
     assert(raft.state.persistent.currentTerm === message.term);
@@ -500,7 +500,7 @@ function handleAppendEntriesCall(raft: Raft, time: number, message: AppendEntrie
     };
 }
 
-function handleAppendEntriesReply(raft: Raft, message: AppendEntriesReply): StepResult {
+function handleAppendEntriesReply<Cmd>(raft: Raft<Cmd>, message: AppendEntriesReply): StepResult<Cmd> {
     // TODO: Message validation
 
     assert(raft.state.persistent.currentTerm === message.term);
@@ -588,7 +588,7 @@ function handleAppendEntriesReply(raft: Raft, message: AppendEntriesReply): Step
     }
 }
 
-function handleRequestVotesCall(raft: Raft, time: number, message: RequestVoteCall): StepResult {
+function handleRequestVotesCall<Cmd>(raft: Raft<Cmd>, time: number, message: RequestVoteCall): StepResult<Cmd> {
     // TODO: Validate message before processing
 
     assert(raft.state.persistent.currentTerm === message.term);
@@ -650,7 +650,7 @@ function handleRequestVotesCall(raft: Raft, time: number, message: RequestVoteCa
     };
 }
 
-function handleRequestVotesReply(raft: Raft, time: number, message: RequestVoteReply): StepResult {
+function handleRequestVotesReply<Cmd>(raft: Raft<Cmd>, time: number, message: RequestVoteReply): StepResult<Cmd> {
     // TODO: Validate message before processing
 
     assert(raft.state.persistent.currentTerm === message.term);

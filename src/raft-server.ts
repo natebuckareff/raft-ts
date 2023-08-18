@@ -2,20 +2,20 @@ import { create, step } from './raft.js';
 import type { Time } from './time.js';
 import type { LogEntry, Raft, RaftConfig, RaftMessage } from './types';
 
-export class RaftServer {
-    private _raft: Raft;
-    private _inbox: RaftMessage[];
-    private _outbox: RaftMessage[];
-    private _receive: () => RaftMessage | undefined;
+export class RaftServer<Cmd> {
+    private _raft: Raft<Cmd>;
+    private _inbox: RaftMessage<Cmd>[];
+    private _outbox: RaftMessage<Cmd>[];
+    private _receive: () => RaftMessage<Cmd> | undefined;
 
-    constructor(public readonly time: Time, public readonly config: RaftConfig) {
+    constructor(public readonly time: Time, public readonly config: RaftConfig<Cmd>) {
         this._raft = create({ config, time: time.now() });
         this._inbox = [];
         this._outbox = [];
         this._receive = () => this._inbox.shift();
     }
 
-    update(): LogEntry[] {
+    update(): LogEntry<Cmd>[] {
         const result = step(this._raft, this.time.now(), this._receive);
 
         if (result !== undefined) {
@@ -33,7 +33,7 @@ export class RaftServer {
         return [];
     }
 
-    send(): RaftMessage[] {
+    send(): RaftMessage<Cmd>[] {
         const { _outbox } = this;
         this._outbox = [];
         return _outbox;

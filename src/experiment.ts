@@ -23,19 +23,19 @@ async function intervalLoop(maxIterations: number, timestep: number, fn: (time: 
     });
 }
 
-interface Inbox {
-    queue: RaftMessage[];
-    receive: () => RaftMessage | undefined;
+interface Inbox<Cmd> {
+    queue: RaftMessage<Cmd>[];
+    receive: () => RaftMessage<Cmd> | undefined;
 }
 
-class InboxSet {
-    private _inboxes: Map<PeerID, Inbox>;
+class InboxSet<Cmd> {
+    private _inboxes: Map<PeerID, Inbox<Cmd>>;
 
     constructor() {
         this._inboxes = new Map();
     }
 
-    get(id: PeerID): Inbox {
+    get(id: PeerID): Inbox<Cmd> {
         let inbox = this._inboxes.get(id);
         if (inbox === undefined) {
             inbox = { queue: [], receive: () => this.receive(id) };
@@ -44,37 +44,37 @@ class InboxSet {
         return inbox;
     }
 
-    send(message: RaftMessage): void {
+    send(message: RaftMessage<Cmd>): void {
         const { to } = message;
         this.get(to).queue.push(message);
     }
 
-    receive(id: PeerID): RaftMessage | undefined {
+    receive(id: PeerID): RaftMessage<Cmd> | undefined {
         return this.get(id).queue.shift();
     }
 }
 
-export interface ExperimentConfig {
+export interface ExperimentConfig<Cmd> {
     peerCount: number;
     rng: RNG;
-    log: Logger;
+    log: Logger<Cmd>;
     electionInterval: [number, number] | undefined;
     heartbeatTimeout: number;
     maxIterations: number;
     timestep: number;
-    hooks: Hook[];
-    finished: Finished;
+    hooks: Hook<Cmd>[];
+    finished: Finished<Cmd>;
 }
 
-export interface Hook {
-    (servers: Raft[], time: number): void;
+export interface Hook<Cmd> {
+    (servers: Raft<Cmd>[], time: number): void;
 }
 
-export interface Finished {
-    (servers: Raft[], time: number): void;
+export interface Finished<Cmd> {
+    (servers: Raft<Cmd>[], time: number): void;
 }
 
-export async function runExperiment(config: ExperimentConfig) {
+export async function runExperiment<Cmd>(config: ExperimentConfig<Cmd>) {
     const allPeers: PeerID[] = [];
 
     for (let i = 0; i < config.peerCount; ++i) {
@@ -83,18 +83,18 @@ export async function runExperiment(config: ExperimentConfig) {
 
     const { rng, log, electionInterval, heartbeatTimeout } = config;
 
-    const servers: Raft[] = [];
+    const servers: Raft<Cmd>[] = [];
 
     for (const id of allPeers) {
         const peers = allPeers.filter(x => x !== id);
-        const config: RaftConfig = { id, peers, rng, log, electionInterval, heartbeatTimeout };
+        const config: RaftConfig<Cmd> = { id, peers, rng, log, electionInterval, heartbeatTimeout };
         servers.push(create({ config, time: 0 }));
     }
 
-    const inboxes = new InboxSet();
+    const inboxes = new InboxSet<Cmd>();
 
     const fn = (time: number) => {
-        const messages: RaftMessage[] = [];
+        const messages: RaftMessage<Cmd>[] = [];
 
         for (const hook of config.hooks) {
             hook(servers, time);
@@ -103,7 +103,7 @@ export async function runExperiment(config: ExperimentConfig) {
         for (const server of servers) {
             const { queue, receive } = inboxes.get(server.config.id);
             do {
-                const result = step(server, time, receive);
+                const result = step<Cmd>(server, time, receive);
                 if (result !== undefined) {
                     if (result.type === 'SEND') {
                         if ('message' in result) {

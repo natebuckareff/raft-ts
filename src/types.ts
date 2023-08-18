@@ -3,43 +3,40 @@ import type { RNG } from './rng';
 export type PeerID = number & { readonly PeerID: unique symbol };
 export type MessageID = number & { readonly MessageID: unique symbol };
 
-export interface Raft {
-    config: RaftConfig;
-    state: RaftState;
+export interface Raft<Cmd> {
+    config: RaftConfig<Cmd>;
+    state: RaftState<Cmd>;
 }
 
-export interface RaftConfig {
+export interface RaftConfig<Cmd> {
     id: PeerID;
     peers: PeerID[];
     rng: RNG;
-    log: Logger;
+    log: Logger<Cmd>;
     electionInterval: [number, number] | undefined;
     heartbeatTimeout: number;
 }
 
-export interface Logger {
-    <Args extends any[]>(raft: Raft, time: number, message: string, ...args: Args): void;
+export interface Logger<Cmd> {
+    <Args extends any[]>(raft: Raft<Cmd>, time: number, message: string, ...args: Args): void;
 }
 
-export interface RaftState {
-    persistent: RaftPersistent;
+export interface RaftState<Cmd> {
+    persistent: RaftPersistent<Cmd>;
     volatile: RaftVolatile;
     sm: RaftSM;
 }
 
-export interface RaftPersistent {
+export interface RaftPersistent<Cmd> {
     currentTerm: number;
     votedFor: PeerID | null;
-    log: LogEntry[];
+    log: LogEntry<Cmd>[];
 }
 
-export interface LogEntry {
+export interface LogEntry<Cmd> {
     index: number;
     term: number;
-    command:
-        | { type: 'SET'; name: string; value: number }
-        | { type: 'INCR'; name: string; amount: number }
-        | { type: 'DELETE'; name: string };
+    command: Cmd;
 }
 
 export interface RaftVolatile {
@@ -81,27 +78,27 @@ export interface ProposalEntry {
 // TODO: This could also be used for logging and any other side effects that
 // don't require returning anything
 
-export type StepResult =
-    | { type: 'SEND'; message: RaftMessage }
-    | { type: 'SEND'; messages: RaftMessage[] }
-    | { type: 'APPLY'; entries: LogEntry[] }
+export type StepResult<Cmd> =
+    | { type: 'SEND'; message: RaftMessage<Cmd> }
+    | { type: 'SEND'; messages: RaftMessage<Cmd>[] }
+    | { type: 'APPLY'; entries: LogEntry<Cmd>[] }
     | void;
 
-export type RaftMessage =
-    | ProposeCommandCall
+export type RaftMessage<Cmd> =
+    | ProposeCommandCall<Cmd>
     | ProposeCommandReply
-    | AppendEntriesCall
+    | AppendEntriesCall<Cmd>
     | AppendEntriesReply
     | RequestVoteCall
     | RequestVoteReply;
 
-export interface ProposeCommandCall {
+export interface ProposeCommandCall<Cmd> {
     type: 'CALL';
     name: 'PROPOSE_COMMAND';
     id: MessageID;
     from: PeerID;
     to: PeerID;
-    commands: LogEntry['command'][];
+    commands: Cmd[];
 }
 
 export interface ProposeCommandReply {
@@ -112,7 +109,7 @@ export interface ProposeCommandReply {
     success: boolean;
 }
 
-export interface AppendEntriesCall {
+export interface AppendEntriesCall<Cmd> {
     type: 'CALL';
     name: 'APPEND_ENTRIES';
     from: PeerID;
@@ -121,7 +118,7 @@ export interface AppendEntriesCall {
     leaderId: PeerID; // TODO: Is this redundant with `from`?
     prevLogIndex: number;
     prevLogTerm: number;
-    entries: LogEntry[];
+    entries: LogEntry<Cmd>[];
     leaderCommit: number;
 }
 
@@ -158,8 +155,8 @@ export interface RequestVoteReply {
     voteGranted: boolean;
 }
 
-export interface CreateArgs {
-    config: RaftConfig;
-    persistent?: RaftPersistent;
+export interface CreateArgs<Cmd> {
+    config: RaftConfig<Cmd>;
+    persistent?: RaftPersistent<Cmd>;
     time: number;
 }

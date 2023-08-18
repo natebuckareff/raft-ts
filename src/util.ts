@@ -8,7 +8,7 @@ export const randomInterval = (rng: RNG, start: number, end: number) => {
     return start + rng.random() * (end - start);
 };
 
-export function log<Args extends any[]>(raft: Raft, time: number, message: string, ...args: Args) {
+export function log<Cmd, Args extends any[]>(raft: Raft<Cmd>, time: number, message: string, ...args: Args) {
     const { id } = raft.config;
     const { status } = raft.state.sm;
     const { currentTerm } = raft.state.persistent;
