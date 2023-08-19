@@ -1,4 +1,5 @@
 import assert from 'assert';
+import type { RNG } from '../rng';
 
 export interface Task<T> {
     id: number;
@@ -124,5 +125,15 @@ export const createRoundRobinStrategy = <T>(): SchedulerStrategy<T> => {
             queue.push(id);
         }
         return id;
+    };
+};
+
+export const createRandomStrategy = <T>(rng: RNG): SchedulerStrategy<T> => {
+    let ids: number[] = [];
+    return sched => {
+        ids = ids.filter(id => !sched.metrics.killed.includes(id));
+        ids.push(...sched.metrics.spawned);
+        const i = Math.floor(rng.random() * ids.length);
+        return ids[i];
     };
 };
