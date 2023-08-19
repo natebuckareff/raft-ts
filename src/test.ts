@@ -1,84 +1,62 @@
 import assert from 'assert';
-import { runExperiment } from './experiment.js';
-import { create } from './raft.js';
+import { RaftServer } from './raft-server.js';
 import { XoroRng } from './rng.js';
+import { TaskScheduler, createRandomStrategy } from './test/task-scheduler.js';
+import { DeterministicTime } from './time.js';
+import type { PeerID, RaftMessage } from './types.js';
 import { log } from './util.js';
 
-async function sanityCheck(timeScale = 1) {
-    console.log('--- sanityCheck ' + '-'.repeat(32 - 'sanityCheck'.length));
-    await runExperiment({
-        rng: new XoroRng('test2-2023-08-17'),
-        log: (raft, time, message, ...args) => {
-            return log(raft, time, message, ...args);
-        },
-        electionInterval: [150 * timeScale, 300 * timeScale],
-        heartbeatTimeout: 60 * timeScale,
-        peerCount: 3,
-        timestep: 1,
-        maxIterations: 500 * timeScale,
-        hooks: [],
-        finished: (servers, time) => {
-            console.log('--- results ' + '-'.repeat(32 - 'results'.length));
-            assert(time === 502 * timeScale);
-            console.log(`time: ${time}`);
-            const expect = [
-                { id: 0, status: 'FOLLOWER' },
-                { id: 1, status: 'FOLLOWER' },
-                { id: 2, status: 'LEADER' },
-            ];
-            for (let i = 0; i < expect.length; ++i) {
-                const { id, status } = expect[i]!;
-                const server = servers[i]!;
-                assert(server.config.id === id);
-                assert(server.state.sm.status === status);
-                console.log(`server(${server.config.id}): status=${server.state.sm.status}`);
+type KVCommand = { type: 'SET'; name: string; value: number } | { type: 'DELETE'; name: string };
+
+const rng = new XoroRng('blag');
+const time = new DeterministicTime();
+
+const sched = new TaskScheduler<RaftMessage<KVCommand>>({
+    router: (_, { to }) => to,
+    strategy: createRandomStrategy(rng),
+});
+
+const ids: PeerID[] = [0, 1, 2] as PeerID[];
+const servers: RaftServer<KVCommand>[] = [];
+
+for (const peerId of ids) {
+    sched.spawn(function* (id, receive) {
+        assert(id === peerId);
+
+        const server = new RaftServer<KVCommand>(time, {
+            id: peerId,
+            peers: ids.filter(x => x !== id),
+            rng,
+            log: (raft, time, message, ...args) => log(raft, time, message, ...args),
+            heartbeatTimeout: 60,
+        });
+
+        servers.push(server);
+
+        while (true) {
+            const message = receive();
+            if (message !== undefined) {
+                server.write(message);
             }
-            console.log('--- finished ' + '-'.repeat(32 - 'finished'.length));
-        },
+
+            for (const x of server.update()) {
+                console.log('>>>', id, x);
+            }
+
+            yield;
+
+            for (const message of server.read()) {
+                yield message;
+            }
+        }
     });
 }
 
-async function distruptOneServer(timeScale = 1) {
-    console.log('--- distruptOneServer ' + '-'.repeat(32 - 'distruptOneServer'.length));
-    await runExperiment({
-        rng: new XoroRng('bar'),
-        log: (raft, time, message, ...args) => {
-            return log(raft, time, message, ...args);
-        },
-        electionInterval: [150 * timeScale, 300 * timeScale],
-        heartbeatTimeout: 60 * timeScale,
-        peerCount: 3,
-        timestep: 1,
-        maxIterations: 600 * timeScale,
-        hooks: [
-            (servers, time) => {
-                if (time === 283) {
-                    console.log('disrupting leader 2');
-                    const target = servers[2]!;
-                    target.state = create({ config: target.config, time }).state;
-                }
-            },
-        ],
-        finished: (servers, time) => {
-            console.log('--- results ' + '-'.repeat(32 - 'results'.length));
-            assert(time === 602 * timeScale);
-            console.log(`time: ${time}`);
-            const expect = [
-                { id: 0, status: 'LEADER' },
-                { id: 1, status: 'FOLLOWER' },
-                { id: 2, status: 'FOLLOWER' },
-            ];
-            for (let i = 0; i < expect.length; ++i) {
-                const { id, status } = expect[i]!;
-                const server = servers[i]!;
-                assert(server.config.id === id);
-                assert(server.state.sm.status === status);
-                console.log(`server(${server.config.id}): status=${server.state.sm.status}`);
-            }
-            console.log('--- finished ' + '-'.repeat(32 - 'finished'.length));
-        },
-    });
+for (let i = 0; i < 400; ++i) {
+    sched.run();
+    await new Promise(resolve => setTimeout(resolve, 2));
 }
 
-await sanityCheck();
-await distruptOneServer();
+for (const server of servers) {
+    console.log(server.raft.state.sm.status);
+}

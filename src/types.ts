@@ -13,7 +13,7 @@ export interface RaftConfig<Cmd> {
     peers: PeerID[];
     rng: RNG;
     log: Logger<Cmd>;
-    electionInterval: [number, number] | undefined;
+    electionInterval?: [number, number] | undefined;
     heartbeatTimeout: number;
 }
 

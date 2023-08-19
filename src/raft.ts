@@ -422,14 +422,12 @@ function handleAppendEntriesCall<Cmd>(raft: Raft<Cmd>, time: number, message: Ap
 
     assert(raft.state.persistent.currentTerm === message.term);
 
-    const { sm } = raft.state;
-
     // paper(Figure 3): Election Safety: at most one leader can be elected in a
     // given term. §5.2
 
-    assert(sm.status !== 'LEADER', 'not possible for two leaders to exist during the same term');
+    assert(raft.state.sm.status !== 'LEADER', 'not possible for two leaders to exist during the same term');
 
-    if (sm.status === 'CANDIDATE') {
+    if (raft.state.sm.status === 'CANDIDATE') {
         // paper(5.2): If the leader’s term (included in its RPC) is at least as
         // large as the candidate’s current term, then the candidate recognizes
         // the leader as legitimate and returns to follower state.
@@ -449,7 +447,7 @@ function handleAppendEntriesCall<Cmd>(raft: Raft<Cmd>, time: number, message: Ap
 
     // Sanity check. At this point the server is either already a follower or
     // was a candidate and reverted to being a follower
-    assert(sm.status === 'FOLLOWER');
+    assert(raft.state.sm.status === 'FOLLOWER');
 
     // paper(5.3): When sending an AppendEntries RPC, the leader includes the
     // index and term of the entry in its log that immediately precedes the new
@@ -655,7 +653,7 @@ function handleRequestVotesReply<Cmd>(raft: Raft<Cmd>, time: number, message: Re
 
     assert(raft.state.persistent.currentTerm === message.term);
 
-    const sm = raft.state.sm;
+    const { sm } = raft.state;
 
     if (sm.status !== 'CANDIDATE') {
         return;

@@ -15,6 +15,10 @@ export class RaftServer<Cmd> {
         this._receive = () => this._inbox.shift();
     }
 
+    get raft(): Raft<Cmd> {
+        return this._raft;
+    }
+
     update(): LogEntry<Cmd>[] {
         const result = step(this._raft, this.time.now(), this._receive);
 
@@ -33,9 +37,13 @@ export class RaftServer<Cmd> {
         return [];
     }
 
-    send(): RaftMessage<Cmd>[] {
+    read(): RaftMessage<Cmd>[] {
         const { _outbox } = this;
         this._outbox = [];
         return _outbox;
+    }
+
+    write(...messages: RaftMessage<Cmd>[]): void {
+        this._inbox.push(...messages);
     }
 }

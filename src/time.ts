@@ -9,6 +9,10 @@ export class DeterministicTime {
         this._time = time;
     }
 
+    step(amount: number): void {
+        this._time += amount;
+    }
+
     now(): number {
         return this._time++;
     }
